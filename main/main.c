@@ -13,9 +13,9 @@
 #include "lwip/pbuf.h"
 #include "lwip/tcp.h"
 
-#define WIFI_SSID "corsi"
-#define WIFI_PASSWORD "1223334444"
-#define SERVER_IP "192.168.161.227"
+#define WIFI_SSID "iPhone de PH"
+#define WIFI_PASSWORD "perereca"
+#define SERVER_IP "172.20.10.2"
 
 #define TCP_PORT 5000
 #define DEBUG_printf printf
@@ -23,8 +23,6 @@
 
 #define TEST_ITERATIONS 10
 #define POLL_TIME_S 5
-
-QueueHandle_t xQueueTcpRecData;
 
 #if 0
 static void dump_bytes(const uint8_t *bptr, uint32_t len) {
@@ -144,6 +142,7 @@ err_t tcp_client_recv(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t err
     // cyw43_arch_lwip_begin IS needed
     cyw43_arch_lwip_check();
     if (p->tot_len > 0) {
+        DEBUG_printf("recv %d err %d\n", p->tot_len, err);
         for (struct pbuf *q = p; q != NULL; q = q->next) {
             DUMP_BYTES(q->payload, q->len);
         }
@@ -153,11 +152,17 @@ err_t tcp_client_recv(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t err
                                                p->tot_len > buffer_left ? buffer_left : p->tot_len, 0);
         tcp_recved(tpcb, p->tot_len);
     }
-
-    xQueueSendFromISR(xQueueTcpRecData, p->payload, 0);
-
     pbuf_free(p);
 
+    // If we have received the whole buffer, send it back to the server
+    if (state->buffer_len == BUF_SIZE) {
+        DEBUG_printf("Writing %d bytes to server\n", state->buffer_len);
+        err_t error = tcp_write(tpcb, state->buffer, state->buffer_len, TCP_WRITE_FLAG_COPY);
+        if (error != ERR_OK) {
+            DEBUG_printf("Failed to write data %d\n", err);
+            return tcp_result(arg, -1);
+        }
+    }
     return ERR_OK;
 }
 
@@ -200,82 +205,63 @@ static TCP_CLIENT_T *tcp_client_init(void) {
     return state;
 }
 
-int verify_ack(const char *response) {
-    // Expected status line for a successful response
-    const char *expected_status = "HTTP/1.1 200 OK";
-
-    // Check if the response starts with the expected status line
-    if (strncmp(response, expected_status, strlen(expected_status)) == 0) {
-        return 1; // ACK is correct
-    } else {
-        return 0; // ACK is incorrect
-    }
-}
-
-int extract_content_length(const char *response) {
-    const char *content_length_str = "Content-Length: ";
-    char *content_length_pos = strstr(response, content_length_str);
-
-    if (content_length_pos) {
-        content_length_pos += strlen(content_length_str); // Move pointer to the start of the content length value
-        return atoi(content_length_pos);                  // Convert content length value to integer
-    } else {
-        printf("Content-Length not found in response.\n");
-        return -1; // Return -1 if Content-Length header is not found
-    }
-}
-
 void wifi_task(void *p) {
 
+    // Contador
+    int cnt = 0;
+    bool button_pressed = false;
+
     while (1) {
-        char request_new[255];
-        snprintf(request_new, sizeof(request_new),
-                 "GET /get_data?dado HTTP/1.1\r\n"
-                 "Host: 0.0.0.0\r\n" // Replace with the actual server IP
-                 "Accept: */*\r\n"
-                 "\r\n");
-        TCP_CLIENT_T *state = tcp_client_init();
+        // Read the GPIO 15 pin (Active low: 0 when pressed)
+        if (gpio_get(15) == 0) {
+            if (!button_pressed) { // Button was not previously pressed
+                button_pressed = true;
 
-        if (state && tcp_client_open(state)) {
-            printf("SOCKET: Conectado ao servidor\n");
-            cyw43_arch_lwip_begin();
-            int err = tcp_write(state->tcp_pcb, request_new, strlen(request_new), 0);
-            cyw43_arch_lwip_end();
+                char payload_content[64];
+                int payload_length = 0;
+                payload_length = sprintf(payload_content, "dado=%d", cnt);
 
-            if (err != ERR_OK) {
-                printf("TCP: Falha ao enviar dados\n");
-                printf("TCP: Servidor está rodando? Porta e IP corretos?\n");
-                printf("\nerrno: %d \n", err);
-            } else {
-                printf("TCP: Dados enviados com sucesso\n");
-            }
+                const char *http_request = "POST /post_data HTTP/1.1\r\n"
+                                           "Content-Type: application/x-www-form-urlencoded\r\n"
+                                           "Content-Length: %d\r\n"
+                                           "\r\n"
+                                           "%s";
 
-            char tcpRecData[1024];
-            int content_length;
-            // ACK
-            if (xQueueReceive(xQueueTcpRecData, tcpRecData, 1000)) {
-                if (verify_ack(tcpRecData)) {
-                    content_length = extract_content_length(tcpRecData);
-                    printf("HTTP: ack 200 from server\n");
-                    if (xQueueReceive(xQueueTcpRecData, tcpRecData, 1000)) {
-                        tcpRecData[content_length] = 0;
-                        printf("HTTP: Dado recebido:\n");
-                        printf("%s\n", tcpRecData);
+                char request_new[255];
+                sprintf(request_new, http_request, payload_length, payload_content);
+                printf("%s\n", request_new);
+
+                TCP_CLIENT_T *state = tcp_client_init();
+
+                if (state && tcp_client_open(state)) {
+                    printf("SOCKET: Conectado ao servidor\n");
+                    cyw43_arch_lwip_begin();
+                    int err = tcp_write(state->tcp_pcb, request_new, strlen(request_new), 0);
+                    cyw43_arch_lwip_end();
+
+                    if (err != ERR_OK) {
+                        printf("TCP: Falha ao enviar dados\n");
+                        printf("TCP: Servidor está rodando? Porta e IP corretos?\n");
+                        printf("\nerrno: %d \n", err);
+                    } else {
+                        printf("TCP: Dados enviados com sucesso\n");
+                        cnt++;
                     }
+
+                    vTaskDelay(pdMS_TO_TICKS(500));
                 } else {
-                    printf("HTTP: ack error from server \n");
-                    printf(tcpRecData);
+                    printf("SOCKET: Falha ao conectar ao servidor\n");
+                    printf("SOCKET: Verifique IP, porta e rede wifi\n");
                 }
+
+                tcp_client_close(state);
+                free(state);
             }
-
-            tcp_client_close(state);
-            free(state);
-
-            vTaskDelay(pdMS_TO_TICKS(500));
         } else {
-            printf("SOCKET: Falha ao conectar ao servidor\n");
-            printf("SOCKET: Verifique IP, porta e rede wifi\n");
+            button_pressed = false; // Reset button state when not pressed
         }
+
+        vTaskDelay(pdMS_TO_TICKS(50)); // Short delay to prevent busy looping
     }
 }
 
@@ -283,6 +269,11 @@ int main() {
     char sIP[] = "xxx.xxx.xxx.xxx";
 
     stdio_init_all();
+
+    // Initialize GPIO 15 for button input
+    gpio_init(15);
+    gpio_set_dir(15, GPIO_IN);
+    gpio_pull_up(15); // Enable internal pull-up resistor
 
     // Inicializa o módulo Wi-Fi
     if (cyw43_arch_init()) {
@@ -310,8 +301,7 @@ int main() {
     strcpy(sIP, ip4addr_ntoa(netif_ip4_addr(netif_list)));
     printf("Conectado, IP %s\n", sIP);
 
-    xQueueTcpRecData = xQueueCreate(2, 1024);
-    xTaskCreate(wifi_task, "wifi task", 4095, NULL, 1, NULL);
+    xTaskCreate(wifi_task, "wifi task", 4096, NULL, 1, NULL);
 
     vTaskStartScheduler();
 
